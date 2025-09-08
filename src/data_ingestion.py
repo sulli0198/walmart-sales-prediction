@@ -2,7 +2,7 @@ import os
 import requests
 import psycopg2
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta, date
 from dotenv import load_dotenv
 import logging
 
@@ -43,7 +43,7 @@ def fetch_walmart_stock_data(api_key):
         'function': 'TIME_SERIES_DAILY_ADJUSTED',
         'symbol': 'WMT',  # Walmart stock symbol
         'apikey': api_key,
-        'outputsize': 'compact'  # Gets last 100 trading days
+        'outputsize': 'full'  # Gets up to 20 years of data (change from 'compact')
     }
     
     logger.info("Fetching Walmart stock data from Alpha Vantage...")
@@ -75,6 +75,63 @@ def fetch_walmart_stock_data(api_key):
         logger.error(f"Error processing Alpha Vantage response: {e}")
         raise
 
+def fetch_historical_weather_data(start_date, end_date, city="Bentonville"):
+    """Fetch historical weather data from Open-Meteo API"""
+    
+    # City coordinates (Walmart HQ: Bentonville, Arkansas)
+    city_coords = {
+        "Bentonville": {"lat": 36.37, "lon": -94.21},
+        "New York": {"lat": 40.71, "lon": -74.01}
+    }
+    
+    if city not in city_coords:
+        city = "Bentonville"  # Default fallback
+    
+    coords = city_coords[city]
+    
+    # Open-Meteo Historical Weather API
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        'latitude': coords['lat'],
+        'longitude': coords['lon'],
+        'start_date': start_date.strftime('%Y-%m-%d'),
+        'end_date': end_date.strftime('%Y-%m-%d'),
+        'daily': [
+            'temperature_2m_max',
+            'temperature_2m_min', 
+            'temperature_2m_mean',
+            'relative_humidity_2m_max',
+            'surface_pressure',
+            'windspeed_10m_max',
+            'precipitation_sum'
+        ],
+        'timezone': 'America/Chicago'  # Arkansas timezone
+    }
+    
+    logger.info(f"Fetching weather data for {city} from {start_date} to {end_date}...")
+    
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json()
+        
+        if 'daily' not in data:
+            raise ValueError("No daily weather data found in API response")
+        
+        daily_data = data['daily']
+        dates = daily_data['time']
+        
+        logger.info(f"Successfully fetched weather data for {len(dates)} days")
+        
+        return daily_data, city
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching weather data: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Error processing weather response: {e}")
+        raise
+
 def process_stock_data(time_series_data):
     """Process and clean the stock data"""
     
@@ -85,6 +142,11 @@ def process_stock_data(time_series_data):
         try:
             # Convert date string to date object
             date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+            
+            # Only get last year of data to match weather
+            one_year_ago = date.today() - timedelta(days=365)
+            if date_obj < one_year_ago:
+                continue
             
             # Extract and convert stock data
             record = {
@@ -105,7 +167,53 @@ def process_stock_data(time_series_data):
             logger.warning(f"Error processing data for date {date_str}: {e}")
             continue
     
-    logger.info(f"Successfully processed {len(processed_data)} records")
+    logger.info(f"Successfully processed {len(processed_data)} stock records")
+    return processed_data
+
+def process_weather_data(daily_weather_data, city):
+    """Process and clean the weather data"""
+    
+    logger.info("Processing weather data...")
+    processed_data = []
+    
+    dates = daily_weather_data['time']
+    
+    for i, date_str in enumerate(dates):
+        try:
+            # Convert date string to date object
+            date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+            
+            # Extract weather data (handle potential None values)
+            temp_max = daily_weather_data['temperature_2m_max'][i]
+            temp_min = daily_weather_data['temperature_2m_min'][i]
+            temp_mean = daily_weather_data['temperature_2m_mean'][i]
+            humidity = daily_weather_data['relative_humidity_2m_max'][i]
+            pressure = daily_weather_data['surface_pressure'][i]
+            wind_speed = daily_weather_data['windspeed_10m_max'][i]
+            precipitation = daily_weather_data['precipitation_sum'][i]
+            
+            record = {
+                'date': date_obj,
+                'city': city,
+                'temperature_avg': temp_mean,
+                'temperature_min': temp_min,
+                'temperature_max': temp_max,
+                'humidity': int(humidity) if humidity is not None else None,
+                'pressure': pressure,
+                'wind_speed': wind_speed,
+                'weather_condition': 'Clear' if precipitation == 0 else 'Precipitation',
+                'weather_description': f'Precipitation: {precipitation}mm' if precipitation > 0 else 'Clear day',
+                'visibility': 10.0,  # Default visibility
+                'uv_index': 5.0  # Default UV index
+            }
+            
+            processed_data.append(record)
+            
+        except (ValueError, KeyError, IndexError) as e:
+            logger.warning(f"Error processing weather data for date {date_str}: {e}")
+            continue
+    
+    logger.info(f"Successfully processed {len(processed_data)} weather records")
     return processed_data
 
 def connect_to_database(db_config):
@@ -166,48 +274,106 @@ def insert_stock_data(conn, stock_data):
         conn.commit()
         cursor.close()
         
-        logger.info(f"Successfully inserted/updated {inserted_count} records")
+        logger.info(f"Successfully inserted/updated {inserted_count} stock records")
         return inserted_count
         
     except psycopg2.Error as e:
-        logger.error(f"Error inserting data into database: {e}")
+        logger.error(f"Error inserting stock data into database: {e}")
         conn.rollback()
         raise
 
-def verify_data_insertion(conn):
-    """Verify that data was inserted correctly"""
+def insert_weather_data(conn, weather_data):
+    """Insert weather data into weather_raw_data table"""
     
     try:
         cursor = conn.cursor()
         
-        # Count total records
-        cursor.execute("SELECT COUNT(*) FROM walmart_raw_data")
-        total_count = cursor.fetchone()[0]
+        # SQL insert query
+        insert_query = """
+        INSERT INTO weather_raw_data 
+        (date, city, temperature_avg, temperature_min, temperature_max, 
+         humidity, pressure, wind_speed, weather_condition, weather_description,
+         visibility, uv_index)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (date, city) DO UPDATE SET
+            temperature_avg = EXCLUDED.temperature_avg,
+            temperature_min = EXCLUDED.temperature_min,
+            temperature_max = EXCLUDED.temperature_max,
+            humidity = EXCLUDED.humidity,
+            pressure = EXCLUDED.pressure,
+            wind_speed = EXCLUDED.wind_speed,
+            weather_condition = EXCLUDED.weather_condition,
+            weather_description = EXCLUDED.weather_description,
+            visibility = EXCLUDED.visibility,
+            uv_index = EXCLUDED.uv_index
+        """
         
-        # Get date range
+        logger.info("Inserting weather data into database...")
+        
+        # Insert data
+        inserted_count = 0
+        for record in weather_data:
+            cursor.execute(insert_query, (
+                record['date'],
+                record['city'],
+                record['temperature_avg'],
+                record['temperature_min'],
+                record['temperature_max'],
+                record['humidity'],
+                record['pressure'],
+                record['wind_speed'],
+                record['weather_condition'],
+                record['weather_description'],
+                record['visibility'],
+                record['uv_index']
+            ))
+            inserted_count += 1
+        
+        # Commit the transaction
+        conn.commit()
+        cursor.close()
+        
+        logger.info(f"Successfully inserted/updated {inserted_count} weather records")
+        return inserted_count
+        
+    except psycopg2.Error as e:
+        logger.error(f"Error inserting weather data into database: {e}")
+        conn.rollback()
+        raise
+
+def verify_data_insertion(conn):
+    """Verify that both stock and weather data were inserted correctly"""
+    
+    try:
+        cursor = conn.cursor()
+        
+        # Count records in both tables
+        cursor.execute("SELECT COUNT(*) FROM walmart_raw_data")
+        stock_count = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM weather_raw_data")
+        weather_count = cursor.fetchone()[0]
+        
+        # Get date ranges
         cursor.execute("""
             SELECT MIN(date) as earliest_date, MAX(date) as latest_date 
             FROM walmart_raw_data
         """)
-        date_range = cursor.fetchone()
+        stock_dates = cursor.fetchone()
         
-        # Get sample record
         cursor.execute("""
-            SELECT date, close_price, volume 
-            FROM walmart_raw_data 
-            ORDER BY date DESC 
-            LIMIT 1
+            SELECT MIN(date) as earliest_date, MAX(date) as latest_date 
+            FROM weather_raw_data
         """)
-        sample_record = cursor.fetchone()
+        weather_dates = cursor.fetchone()
         
         cursor.close()
         
         logger.info(f"Data verification complete:")
-        logger.info(f"  Total records: {total_count}")
-        logger.info(f"  Date range: {date_range[0]} to {date_range[1]}")
-        logger.info(f"  Latest record: Date={sample_record[0]}, Close=${sample_record[1]}, Volume={sample_record[2]:,}")
+        logger.info(f"  Stock records: {stock_count} (from {stock_dates[0]} to {stock_dates[1]})")
+        logger.info(f"  Weather records: {weather_count} (from {weather_dates[0]} to {weather_dates[1]})")
         
-        return total_count > 0
+        return stock_count > 0 and weather_count > 0
         
     except psycopg2.Error as e:
         logger.error(f"Error verifying data insertion: {e}")
@@ -217,7 +383,7 @@ def main():
     """Main function to orchestrate the data ingestion process"""
     
     try:
-        logger.info("Starting Walmart stock data ingestion process...")
+        logger.info("Starting data ingestion process (Stock + Weather)...")
         
         # Load environment variables
         api_key, db_config = load_environment_variables()
@@ -225,19 +391,33 @@ def main():
         # Fetch stock data from Alpha Vantage
         time_series_data = fetch_walmart_stock_data(api_key)
         
-        # Process the data
-        processed_data = process_stock_data(time_series_data)
+        # Process stock data
+        processed_stock_data = process_stock_data(time_series_data)
         
-        if not processed_data:
-            logger.error("No valid data to insert")
+        if not processed_stock_data:
+            logger.error("No valid stock data to insert")
             return False
+        
+        # Get date range from stock data for weather fetching
+        stock_dates = [record['date'] for record in processed_stock_data]
+        start_date = min(stock_dates)
+        end_date = max(stock_dates)
+        
+        # Fetch weather data for the same date range
+        weather_daily_data, city = fetch_historical_weather_data(start_date, end_date)
+        
+        # Process weather data
+        processed_weather_data = process_weather_data(weather_daily_data, city)
         
         # Connect to database
         conn = connect_to_database(db_config)
         
         try:
-            # Insert data into database
-            inserted_count = insert_stock_data(conn, processed_data)
+            # Insert stock data
+            stock_inserted = insert_stock_data(conn, processed_stock_data)
+            
+            # Insert weather data
+            weather_inserted = insert_weather_data(conn, processed_weather_data)
             
             # Verify insertion
             verification_success = verify_data_insertion(conn)
@@ -260,11 +440,14 @@ def main():
 if __name__ == "__main__":
     success = main()
     if success:
-        print("\n🎉 SUCCESS: Walmart stock data has been loaded into your database!")
-        print("💡 Next steps:")
+        print("\n🎉 SUCCESS: Stock and weather data loaded into your database!")
+        print("💡 Data summary:")
+        print("   • Walmart stock data (last year)")
+        print("   • Historical weather data from Open-Meteo")
+        print("   • Data aligned by date for analysis")
+        print("\n📊 Next steps:")
         print("   1. Check your data in pgAdmin")
-        print("   2. Add weather API when ready")
-        print("   3. Move on to SQL transformations")
+        print("   2. Move on to SQL transformations (Week 2)")
     else:
         print("\n❌ FAILED: Check the logs above for details")
         print("💡 Common fixes:")
